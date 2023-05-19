@@ -1,0 +1,270 @@
+import SwiftUI
+import CloudKit
+import Foundation
+import Combine
+
+class CloudKitManager {
+    static let shared = CloudKitManager()
+
+    private let publicDB = CKContainer.default().publicCloudDatabase
+    private let foodRecordType = "foodDatabase"
+
+    func save(food: FoodItem, completion: @escaping (Result<CKRecord?, Error>) -> Void) {
+        let predicate = NSPredicate(format: "id == %@ AND description == %@", food.id as NSNumber, food.description)
+        let query = CKQuery(recordType: foodRecordType, predicate: predicate)
+
+        let queryOperation = CKQueryOperation(query: query)
+        queryOperation.desiredKeys = ["id", "description"]
+        queryOperation.resultsLimit = 1
+
+        var matchedRecords = [CKRecord]()
+
+        queryOperation.recordMatchedBlock = { recordID, recordResult in
+            switch recordResult {
+            case .failure(let error):
+                print("Failed to fetch record: \(error)")
+            case .success(let record):
+                print("Successfully fetched record")
+                matchedRecords.append(record)
+            }
+        }
+
+
+
+        queryOperation.queryResultBlock = { result in
+            switch result {
+            case .success:
+                if matchedRecords.isEmpty {
+                    DispatchQueue.main.async {
+                        let record = CKRecord(recordType: self.foodRecordType)
+                        record.setValuesForKeys([
+                            "name":food.description,
+                            "id":food.id
+                        ])
+                        self.publicDB.save(record) { (savedRecord, error) in
+                            if let error = error {
+                                print("Error saving record: \(error.localizedDescription)")
+                                completion(.failure(error))
+                            } else {
+                                print("Successfully saved record.")
+                                completion(.success(savedRecord))
+                            }
+                        }
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        let error = NSError(domain: "CloudKit", code: 409, userInfo: [NSLocalizedDescriptionKey: "Record already exists"])
+                        print("Record already exists: \(error)")
+                        completion(.failure(error))
+                    }
+                }
+            case .failure(let error):
+                print("Query operation failed with error: \(error)")
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+
+
+
+        publicDB.add(queryOperation)
+    }
+
+}
+
+class FoodAPI {
+    static let shared = FoodAPI()
+
+    func fetchFoods(query: String, completion: @escaping (Result<[FoodItem], Error>) -> Void) {
+            let urlString = "https://api.nal.usda.gov/fdc/v1/foods/search?query=\(query)&api_key=hJdcR4kpCbUGe6EtlVqMaxHp6hqM2jUudkxHczFe"
+            guard let url = URL(string: urlString) else { return }
+            print(url)
+            URLSession.shared.dataTask(with: url) { data, response, error in
+                if let error = error {
+                    completion(.failure(error))
+                } else if let data = data {
+                    let decoder = JSONDecoder()
+                    do {
+                        let response = try decoder.decode(ApiResponse.self, from: data)
+                        completion(.success(response.foods))
+                    } catch {
+                        completion(.failure(error))
+                    }
+                }
+            }.resume()
+        }
+    }
+
+class FoodSearchViewModel: ObservableObject {
+    @Published var searchTerm: String = ""
+    @Published var searchResults: [FoodItem] = []
+    private var cancellable: AnyCancellable?
+
+    init() {
+        cancellable = $searchTerm
+            .debounce(for: 0.5, scheduler: DispatchQueue.main)
+            .sink { [weak self] in self?.search($0) }
+    }
+
+    func search(_ query: String) {
+        guard query.count > 2 else {
+            searchResults = []
+            return
+        }
+
+        FoodAPI.shared.fetchFoods(query: query) { result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let foods):
+                        self.searchResults = foods
+                    case .failure:
+                        self.searchResults = []
+                        print("Error\nQuery: \(query)")
+                    }
+                }
+            }
+    }
+}
+
+struct FoodSearchView: View {
+    @StateObject private var viewModel = FoodSearchViewModel()
+
+    var body: some View {
+        NavigationView {
+            VStack {
+                SearchBar(text: $viewModel.searchTerm)
+                List {
+                    Section("Results") {
+                        ForEach(viewModel.searchResults) { food in
+                            NavigationLink(destination: FoodDetailView(food: food)) {
+                                VStack {
+                                    Text(food.description)
+                                    Text(food.brandOwner)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Search Foods")
+        }
+    }
+}
+
+struct SearchBar: View {
+    @Binding var text: String
+    @State private var isEditing = false
+
+    var body: some View {
+        TextField("Search...", text: $text)
+            .padding(7)
+            .padding(.horizontal, 25)
+            .background(Color(.systemGray6))
+            .cornerRadius(8)
+            .overlay(
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.gray)
+                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, 8)
+                    
+                    if isEditing {
+                        Button(action: {
+                            self.text = ""
+                        }) {
+                            Image(systemName: "multiply.circle.fill")
+                                .foregroundColor(.gray)
+                                .padding(.trailing, 8)
+                        }
+                    }
+                }
+            )
+            .padding(.horizontal, 10)
+            .onTapGesture {
+                self.isEditing = true
+            }
+    }
+}
+
+struct FoodDetailView: View {
+    var food: FoodItem
+
+    @State private var showSaveSuccess = false
+    @State private var showAlreadyInDatabase = false
+    @State private var showSaveError = false
+
+    var body: some View {
+        VStack {
+            List {
+                ForEach(food.foodNutrients.filter { $0.value >= 1 }, id: \.nutrientId) { nutrient in
+                    HStack {
+                        Text(nutrient.nutrientName)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text("\(nutrient.value, specifier: "%.2f")\(nutrient.unitName.lowercased())")
+                            .foregroundColor(.gray)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
+                }
+            }
+
+            Button(action: {
+                CloudKitManager.shared.save(food: food) { result in
+                    switch result {
+                    case .success:
+                        self.showSaveSuccess = true
+                    case .failure(let error):
+                        if (error as NSError).code == 409 {
+                            self.showAlreadyInDatabase = true
+                        } else {
+                            self.showSaveError = true
+                        }
+                    }
+                }
+            }) {
+                Text("Save to CloudKit")
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                    .padding()
+                    .foregroundColor(.white)
+                    .background(Color.blue)
+                    .cornerRadius(40)
+            }
+            .padding(.horizontal)
+            .alert(isPresented: $showSaveSuccess) {
+                Alert(title: Text("Success"), message: Text("Item saved successfully."), dismissButton: .default(Text("OK")))
+            }
+            .alert(isPresented: $showAlreadyInDatabase) {
+                Alert(title: Text("Warning"), message: Text("Item already in database."), dismissButton: .default(Text("OK")))
+            }
+            .alert(isPresented: $showSaveError) {
+                Alert(title: Text("Failed"), message: Text("Failed to save item."), dismissButton: .default(Text("OK")))
+            }
+        }
+        .navigationTitle(food.description.capitalized)
+    }
+}
+
+
+struct FoodItem: Codable, Identifiable {
+    let id: Int
+    let description: String
+    let foodNutrients: [FoodNutrient]
+    let brandOwner: String = ""
+    enum CodingKeys: String, CodingKey {
+        case id = "fdcId"
+        case description
+        case foodNutrients
+    }
+}
+
+struct FoodNutrient: Codable {
+    let nutrientId: Int
+    let nutrientName: String
+    let nutrientNumber: String
+    let unitName: String
+    let value: Double
+}
+
+struct ApiResponse: Codable {
+    let foods: [FoodItem]
+}
